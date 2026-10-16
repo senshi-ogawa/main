@@ -57,7 +57,7 @@ def cmd_update(args: argparse.Namespace) -> int:
         if args.limit:
             targets = targets[: args.limit]
 
-        _print(f"{len(targets)}銘柄の株価を更新します。初回は時間がかかります（全銘柄で1時間ほど）。")
+        _print(f"{len(targets)}銘柄の株価を更新します。初回は時間がかかります（全銘柄で1〜2時間ほど）。")
         r = update_prices(store, targets, YahooDownloader(), progress=_print)
         _print("")
         _print(f"新規 {r.new}、差分更新 {r.updated}、取り直し {r.refetched}、"

@@ -33,26 +33,29 @@ def frame(rows, splits=None):
 class FakeDownloader:
     """銘柄ごとの「Yahoo側の全履歴」を持ち、start 以降を返す。"""
 
-    def __init__(self, history):
+    def __init__(self, history, rate_limited=0):
         self.history = history
         self.calls = []
+        self.rate_limited = rate_limited  # 最初のこの回数は回数制限で断る
 
-    def download(self, symbols, start):
-        self.calls.append((tuple(symbols), start))
-        out = {}
-        for s in symbols:
-            df = self.history.get(s, pd.DataFrame())
-            if start is not None and not df.empty:
-                df = df[df.index >= pd.Timestamp(start)]
-            out[s] = df
-        return out
+    def download(self, symbol, start):
+        self.calls.append((symbol, start))
+        if self.rate_limited:
+            self.rate_limited -= 1
+            raise fetch.RateLimited("Too Many Requests. Rate limited. Try after a while.")
+        if symbol not in self.history:
+            raise fetch.NoData("possibly delisted; no price data found")
+        df = self.history[symbol]
+        if start is not None:
+            df = df[df.index >= pd.Timestamp(start)]
+        return df
 
 
 class FailingDownloader:
     def __init__(self):
         self.calls = 0
 
-    def download(self, symbols, start):
+    def download(self, symbol, start):
         self.calls += 1
         raise fetch.DownloadError("CONNECT tunnel failed, response 403")
 
@@ -82,7 +85,9 @@ class StoreCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def update(self, dl, symbols, today):
-        return fetch.update_prices(self.store, symbols, dl, pause=0, today=today, progress=lambda m: None)
+        self.slept = []
+        return fetch.update_prices(self.store, symbols, dl, pause=0, today=today,
+                                   progress=lambda m: None, sleep=self.slept.append)
 
 
 class TestUniverse(unittest.TestCase):
@@ -146,21 +151,19 @@ class TestStore(StoreCase):
 
 
 class TestNormalize(unittest.TestCase):
-    def test_multiindex_and_timezone(self):
+    def test_history_columns_and_timezone(self):
         idx = pd.DatetimeIndex(["2026-01-05 00:00", "2026-01-06 00:00"], tz="Asia/Tokyo")
-        cols = pd.MultiIndex.from_product(
-            [["7203.T", "USDJPY=X"], ["Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]])
+        cols = ["Open", "High", "Low", "Close", "Adj Close", "Volume", "Dividends", "Stock Splits"]
         raw = pd.DataFrame(1.0, index=idx, columns=cols)
-        raw[("USDJPY=X", "Close")] = [150.0, float("nan")]
-        out = fetch.normalize_yf(raw, ["7203.T", "USDJPY=X", "0000.T"])
-        self.assertEqual(list(out["7203.T"].columns), ["open", "high", "low", "close", "volume", "splits"])
-        self.assertIsNone(out["7203.T"].index.tz)
-        self.assertEqual(len(out["USDJPY=X"]), 1)  # 終値が欠けた行は捨てる
-        self.assertTrue(out["0000.T"].empty)
+        raw["Close"] = [150.0, float("nan")]
+        out = fetch.normalize_frame(raw)
+        self.assertEqual(list(out.columns), ["open", "high", "low", "close", "volume", "splits"])
+        self.assertIsNone(out.index.tz)
+        self.assertEqual(len(out), 1)  # 終値が欠けた行は捨てる
 
     def test_empty_download(self):
-        out = fetch.normalize_yf(pd.DataFrame(), ["7203.T"])
-        self.assertTrue(out["7203.T"].empty)
+        self.assertTrue(fetch.normalize_frame(pd.DataFrame()).empty)
+        self.assertTrue(fetch.normalize_frame(None).empty)
 
 
 class TestUpdate(StoreCase):
@@ -172,7 +175,7 @@ class TestUpdate(StoreCase):
         bars = self.store.bars("7203.T")
         self.assertEqual(len(bars), 9)
         self.assertEqual(bars[-1].date, ds[-2])
-        self.assertEqual(dl.calls, [(("7203.T",), None)])
+        self.assertEqual(dl.calls, [("7203.T", None)])
 
     def test_incremental_adds_only_new_days(self):
         ds = days(D(2026, 1, 5), 30)
@@ -217,29 +220,39 @@ class TestUpdate(StoreCase):
         self.assertEqual((r.new, r.nodata, r.errors), (1, 1, 0))
 
     def test_network_failure_aborts_without_writing(self):
-        syms = [s.symbol for s in universe.fx_symbols()]
-        orig = fetch.time.sleep
-        fetch.time.sleep = lambda s: None
-        try:
-            dl = FailingDownloader()
-            r = fetch.update_prices(self.store, syms, dl, batch_size=2, pause=0,
-                                    today=D(2026, 2, 1), progress=lambda m: None)
-        finally:
-            fetch.time.sleep = orig
+        syms = [x.symbol for x in universe.fx_symbols()] + ["7203.T", "9999.T"]
+        dl = FailingDownloader()
+        r = self.update(dl, syms, today=D(2026, 2, 1))
         self.assertTrue(r.aborted)
-        self.assertEqual(dl.calls, fetch.MAX_FAILED_BATCHES_IN_A_ROW * fetch.RETRIES)
-        self.assertEqual(r.errors, 6)
+        self.assertEqual(r.errors, fetch.MAX_ERRORS_IN_A_ROW)
+        self.assertEqual(dl.calls, fetch.MAX_ERRORS_IN_A_ROW * fetch.RETRIES)
         self.assertEqual(self.store.summary()["bars"], 0)
 
-    def test_all_empty_batch_counts_as_failure(self):
-        orig = fetch.time.sleep
-        fetch.time.sleep = lambda s: None
-        try:
-            r = self.update(FakeDownloader({}), ["7203.T", "9999.T"], today=D(2026, 2, 1))
-        finally:
-            fetch.time.sleep = orig
-        self.assertEqual((r.errors, r.nodata), (2, 0))
+    def test_rate_limit_waits_then_continues(self):
+        ds = days(D(2026, 1, 5), 5)
+        dl = FakeDownloader({"7203.T": frame([(d, 100) for d in ds]),
+                             "9999.T": frame([(d, 200) for d in ds])}, rate_limited=2)
+        r = self.update(dl, ["7203.T", "9999.T"], today=ds[-1] + dt.timedelta(days=1))
+        self.assertEqual((r.new, r.errors, r.nodata, r.aborted), (2, 0, 0, False))
+        self.assertEqual(self.slept, list(fetch.RATE_LIMIT_WAITS[:2]))
 
+    def test_endless_rate_limit_stops_and_keeps_what_was_saved(self):
+        ds = days(D(2026, 1, 5), 5)
+        dl = FakeDownloader({"7203.T": frame([(d, 100) for d in ds])})
+        orig = dl.download
+
+        def limited_after_first(symbol, start):
+            if dl.calls:
+                dl.calls.append((symbol, start))
+                raise fetch.RateLimited("Too Many Requests")
+            return orig(symbol, start)
+
+        dl.download = limited_after_first
+        r = self.update(dl, ["7203.T", "9999.T"], today=ds[-1] + dt.timedelta(days=1))
+        self.assertTrue(r.aborted)
+        self.assertEqual(r.new, 1)
+        self.assertEqual(len(self.store.bars("7203.T")), 5)
+        self.assertIn("回数制限", r.messages[-1])
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,9 @@
 - 取り直した重なり部分の終値が保存済みと食い違ったら（株式分割などで
   過去の株価が調整し直された）、その銘柄だけ全期間を取り直す。
 - 当日分は値が確定していない可能性があるので保存しない。
+
+Yahoo は短時間に大量に問い合わせると一時的に受け付けなくなる（回数制限）。
+そのため1銘柄ずつ間を空けて取得し、制限がかかったら待ってから続ける。
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence
+from typing import Callable, Dict, List, Optional, Protocol, Sequence
 
 import pandas as pd
 
@@ -21,87 +24,99 @@ from .store import Bar, PriceStore
 
 JST = dt.timezone(dt.timedelta(hours=9))
 
-BATCH_SIZE = 40
 OVERLAP_DAYS = 14
 TOLERANCE = 0.005  # 終値の食い違いをこれ以上で「調整し直された」とみなす (0.5%)
-RETRIES = 3
-MAX_FAILED_BATCHES_IN_A_ROW = 3
+PAUSE = 0.5        # 銘柄ごとの間隔（秒）
+RETRIES = 3        # 通信エラー時に同じ銘柄を試す回数
+RATE_LIMIT_WAITS = (60, 120, 300, 600, 900)  # 回数制限にかかったときに待つ秒数
+MAX_ERRORS_IN_A_ROW = 10
+PROGRESS_EVERY = 20
 
 
 class DownloadError(Exception):
-    pass
+    """通信の失敗など。少し待てば取れる可能性がある。"""
+
+
+class NoData(Exception):
+    """その銘柄のデータが Yahoo にない（上場直後、コード違いなど）。"""
+
+
+class RateLimited(Exception):
+    """Yahoo の回数制限にかかった。しばらく待つ必要がある。"""
 
 
 class Downloader(Protocol):
-    def download(self, symbols: Sequence[str], start: Optional[dt.date]) -> Dict[str, pd.DataFrame]:
-        """銘柄ごとの日足を返す。列は open/high/low/close/volume/splits、index は日付。
+    def download(self, symbol: str, start: Optional[dt.date]) -> pd.DataFrame:
+        """1銘柄の日足を返す。列は open/high/low/close/volume/splits、index は日付。
 
-        start が None なら取れるだけ過去から。取れなかった銘柄は空の DataFrame か欠落。
+        start が None なら取れるだけ過去から。
+        データがなければ NoData、回数制限なら RateLimited、それ以外の失敗は DownloadError。
         """
         ...
 
 
-def normalize_yf(raw: Optional[pd.DataFrame], symbols: Sequence[str]) -> Dict[str, pd.DataFrame]:
-    """yf.download の結果を銘柄ごとの DataFrame に分ける。"""
-    out: Dict[str, pd.DataFrame] = {}
-    if raw is None or raw.empty:
-        return {s: pd.DataFrame() for s in symbols}
-    multi = isinstance(raw.columns, pd.MultiIndex)
-    for sym in symbols:
-        if multi:
-            if sym not in raw.columns.get_level_values(0):
-                out[sym] = pd.DataFrame()
-                continue
-            df = raw[sym].copy()
-        elif len(symbols) == 1:
-            df = raw.copy()
-        else:
-            out[sym] = pd.DataFrame()
-            continue
-        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
-        if "stock_splits" in df.columns:
-            df = df.rename(columns={"stock_splits": "splits"})
-        if "splits" not in df.columns:
-            df["splits"] = 0.0
-        if "volume" not in df.columns:
-            df["volume"] = 0
-        need = ["open", "high", "low", "close"]
-        if any(c not in df.columns for c in need):
-            out[sym] = pd.DataFrame()
-            continue
-        df = df.dropna(subset=need)
-        df["volume"] = df["volume"].fillna(0)
-        df["splits"] = df["splits"].fillna(0)
-        idx = pd.DatetimeIndex(df.index)
-        if idx.tz is not None:
-            idx = idx.tz_localize(None)
-        df.index = idx.normalize()
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        out[sym] = df[["open", "high", "low", "close", "volume", "splits"]]
-    return out
+def normalize_frame(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """yfinance の DataFrame を open/high/low/close/volume/splits の形にそろえる。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+    if "stock_splits" in df.columns:
+        df = df.rename(columns={"stock_splits": "splits"})
+    if "splits" not in df.columns:
+        df["splits"] = 0.0
+    if "volume" not in df.columns:
+        df["volume"] = 0
+    need = ["open", "high", "low", "close"]
+    if any(c not in df.columns for c in need):
+        return pd.DataFrame()
+    df = df.dropna(subset=need)
+    df["volume"] = df["volume"].fillna(0)
+    df["splits"] = df["splits"].fillna(0)
+    idx = pd.DatetimeIndex(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    df.index = idx.normalize()
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df[["open", "high", "low", "close", "volume", "splits"]]
 
 
 class YahooDownloader:
     """yfinance を使う本番用の取得係。"""
 
-    def download(self, symbols: Sequence[str], start: Optional[dt.date]) -> Dict[str, pd.DataFrame]:
+    def __init__(self) -> None:
         import yfinance as yf
 
-        # 取れなかった銘柄ごとの英語の警告は結果の集計で伝えるので、ここでは表示しない
+        self.yf = yf
+        # 失敗を英語の警告で流さず、例外として受け取って種類ごとに扱う
+        try:
+            yf.config.debug.hide_exceptions = False
+        except AttributeError:  # 古い yfinance
+            pass
         logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-        kwargs = dict(
-            interval="1d", auto_adjust=False, actions=True, group_by="ticker",
-            threads=True, progress=False, multi_level_index=True, timeout=30,
-        )
+
+    def download(self, symbol: str, start: Optional[dt.date]) -> pd.DataFrame:
+        from yfinance import exceptions as yfe
+
+        kwargs = dict(interval="1d", auto_adjust=False, actions=True, timeout=30)
         if start is None:
             kwargs["period"] = "max"
         else:
             kwargs["start"] = start.isoformat()
         try:
-            raw = yf.download(list(symbols), **kwargs)
-        except Exception as e:  # yfinance が例外を投げるのは通信まわりの失敗
+            raw = self.yf.Ticker(symbol).history(**kwargs)
+        except yfe.YFRateLimitError as e:
+            raise RateLimited(str(e)) from e
+        except (yfe.YFPricesMissingError, yfe.YFTzMissingError, yfe.YFTickerMissingError) as e:
+            raise NoData(str(e)) from e
+        except Exception as e:
+            if "Too Many Requests" in str(e) or "429" in str(e):
+                raise RateLimited(str(e)) from e
             raise DownloadError(str(e)) from e
-        return normalize_yf(raw, symbols)
+        df = normalize_frame(raw)
+        if df.empty and start is None:
+            raise NoData("データがありません")
+        return df
 
 
 def frame_to_bars(df: pd.DataFrame, before: dt.date) -> List[Bar]:
@@ -148,9 +163,8 @@ class UpdateResult:
     messages: List[str] = field(default_factory=list)
 
 
-def _batches(items: Sequence[str], size: int) -> Iterable[List[str]]:
-    for i in range(0, len(items), size):
-        yield list(items[i:i + size])
+class _Abort(Exception):
+    pass
 
 
 def update_prices(
@@ -158,10 +172,10 @@ def update_prices(
     symbols: Sequence[str],
     downloader: Downloader,
     *,
-    batch_size: int = BATCH_SIZE,
-    pause: float = 1.0,
+    pause: float = PAUSE,
     today: Optional[dt.date] = None,
     progress: Callable[[str], None] = print,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> UpdateResult:
     today = today or dt.datetime.now(JST).date()
     result = UpdateResult()
@@ -169,90 +183,112 @@ def update_prices(
     fresh_syms = [s for s in symbols if last[s] is None]
     known_syms = [s for s in symbols if last[s] is not None]
     refetch: List[str] = []
-    failed_in_a_row = 0
+    errors_in_a_row = 0
     total = len(symbols)
     done = 0
 
-    def fetch(batch: List[str], start: Optional[dt.date]) -> Optional[Dict[str, pd.DataFrame]]:
-        nonlocal failed_in_a_row
+    def fetch(sym: str, start: Optional[dt.date]) -> Optional[pd.DataFrame]:
+        """取れたら DataFrame、データがなければ空の DataFrame、エラーなら None（記録済み）。
+
+        回数制限や通信エラーが続いたら _Abort で全体を止める。
+        """
+        nonlocal errors_in_a_row
+        waits = list(RATE_LIMIT_WAITS)
         err = ""
-        for attempt in range(RETRIES):
+        attempt = 0
+        while True:
             try:
-                frames = downloader.download(batch, start)
-                # 複数銘柄なのに全部空なら、銘柄ではなく通信の問題とみなす
-                if len(batch) > 1 and all(frames.get(s) is None or frames[s].empty for s in batch):
-                    raise DownloadError("どの銘柄のデータも返ってきませんでした")
-                failed_in_a_row = 0
-                return frames
+                df = downloader.download(sym, start)
+                errors_in_a_row = 0
+                return df
+            except NoData:
+                errors_in_a_row = 0
+                return pd.DataFrame()
+            except RateLimited:
+                if not waits:
+                    result.aborted = True
+                    result.messages.append(
+                        "Yahooの回数制限が続いたので中断しました。しばらく（1時間ほど）おいてから、"
+                        "もう一度起動してください。続きから取得します。")
+                    raise _Abort()
+                w = waits.pop(0)
+                progress(f"Yahooから少し待つよう求められました。{w}秒待ってから続けます…")
+                sleep(w)
             except DownloadError as e:
                 err = str(e)
-                if attempt < RETRIES - 1:
-                    time.sleep(pause * (2 ** (attempt + 1)))
-        failed_in_a_row += 1
-        for s in batch:
-            store.set_fetch_state(s, "error", err)
-        result.errors += len(batch)
-        result.messages.append(f"取得失敗 ({batch[0]} ほか{len(batch) - 1}銘柄): {err}")
+                attempt += 1
+                if attempt >= RETRIES:
+                    break
+                sleep(pause * (2 ** attempt) + 1)
+        errors_in_a_row += 1
+        store.set_fetch_state(sym, "error", err)
+        result.errors += 1
+        result.messages.append(f"取得失敗 ({sym}): {err}")
+        if errors_in_a_row >= MAX_ERRORS_IN_A_ROW:
+            result.aborted = True
+            result.messages.append("連続して取得に失敗したので中断しました。ネットワーク接続を確認してください。")
+            raise _Abort()
         return None
 
-    def run(batches: Iterable[List[str]], start_of: Callable[[List[str]], Optional[dt.date]],
-            handle: Callable[[str, pd.DataFrame], None], label: str) -> bool:
+    def tick(label: str) -> None:
         nonlocal done
-        for batch in batches:
-            frames = fetch(batch, start_of(batch))
-            if frames is not None:
-                for s in batch:
-                    handle(s, frames.get(s, pd.DataFrame()))
-            if label:
-                done += len(batch)
-                progress(f"{label} {done}/{total}")
-            if failed_in_a_row >= MAX_FAILED_BATCHES_IN_A_ROW:
-                result.aborted = True
-                result.messages.append("連続して取得に失敗したので中断しました。ネットワーク接続を確認してください。")
-                return False
-            if pause:
-                time.sleep(pause)
-        return True
+        done += 1
+        if label and (done % PROGRESS_EVERY == 0 or done == total):
+            progress(f"{label} {done}/{total}")
 
-    def handle_full(s: str, df: pd.DataFrame, refetched: bool = False) -> None:
-        bars = frame_to_bars(df, before=today) if not df.empty else []
+    def save_full(sym: str, refetched: bool = False) -> None:
+        df = fetch(sym, None)
+        if df is None:
+            return
+        bars = frame_to_bars(df, before=today)
         if not bars:
-            store.set_fetch_state(s, "nodata")
+            store.set_fetch_state(sym, "nodata")
             result.nodata += 1
             return
-        result.bars_written += store.write_bars(s, bars, replace_all=True)
-        store.set_fetch_state(s, "ok")
+        result.bars_written += store.write_bars(sym, bars, replace_all=True)
+        store.set_fetch_state(sym, "ok")
         if refetched:
             result.refetched += 1
         else:
             result.new += 1
 
-    def handle_incremental(s: str, df: pd.DataFrame) -> None:
-        stored_last = last[s]
+    def save_incremental(sym: str) -> None:
+        stored_last = last[sym]
         assert stored_last is not None
-        if df.empty:
-            store.set_fetch_state(s, "nodata", "新しいデータなし")
+        df = fetch(sym, stored_last - dt.timedelta(days=OVERLAP_DAYS))
+        if df is None:
             return
-        stored = store.closes_since(s, df.index.min().date())
+        if df.empty:
+            store.set_fetch_state(sym, "nodata", "新しいデータなし")
+            return
+        stored = store.closes_since(sym, df.index.min().date())
         if needs_full_refetch(stored, df, stored_last):
-            refetch.append(s)
+            refetch.append(sym)
             return
         bars = [b for b in frame_to_bars(df, before=today) if b.date >= stored_last]
         if bars:
-            result.bars_written += store.write_bars(s, bars)
+            result.bars_written += store.write_bars(sym, bars)
             result.updated += 1
-        store.set_fetch_state(s, "ok")
+        store.set_fetch_state(sym, "ok")
 
-    def incremental_start(batch: List[str]) -> dt.date:
-        return min(last[s] for s in batch) - dt.timedelta(days=OVERLAP_DAYS)  # type: ignore[type-var]
-
-    # 既存の銘柄を先に更新し、続けて新しい銘柄を全期間取得する
-    if not run(_batches(known_syms, batch_size), incremental_start, handle_incremental, "差分更新"):
-        return result
-    if not run(_batches(fresh_syms, batch_size), lambda b: None, handle_full, "新規取得"):
-        return result
-    if refetch:
-        progress(f"株式分割などで過去の株価が変わった {len(refetch)} 銘柄を取り直します")
-        run(_batches(refetch, batch_size), lambda b: None,
-            lambda s, df: handle_full(s, df, refetched=True), "")
+    try:
+        # 既存の銘柄を先に更新し、続けて新しい銘柄を全期間取得する
+        for i, sym in enumerate(known_syms):
+            if i and pause:
+                sleep(pause)
+            save_incremental(sym)
+            tick("差分更新")
+        for i, sym in enumerate(fresh_syms):
+            if (i or known_syms) and pause:
+                sleep(pause)
+            save_full(sym)
+            tick("新規取得")
+        if refetch:
+            progress(f"株式分割などで過去の株価が変わった {len(refetch)} 銘柄を取り直します")
+            for sym in refetch:
+                if pause:
+                    sleep(pause)
+                save_full(sym, refetched=True)
+    except _Abort:
+        pass
     return result
