@@ -106,6 +106,25 @@ class TestUniverse(unittest.TestCase):
         with self.assertRaises(ValueError):
             universe.parse_jpx_list(pd.DataFrame({"code": [1]}))
 
+    def test_find_list_links_on_guide_page(self):
+        html = """<a href="/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx">
+            <img src="xlsx.png"></a><a href="/other.pdf">x</a>"""
+        self.assertEqual(universe.find_list_links(html), [
+            "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"])
+
+    def test_load_xlsx_and_find_cached(self):
+        df = pd.DataFrame({"日付": [20260930], "コード": [7203], "銘柄名": ["トヨタ自動車"],
+                           "市場・商品区分": ["プライム（内国株式）"], "33業種区分": ["輸送用機器"]})
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(universe.cached_jpx_list(Path(d)))
+            path = Path(d) / "data_j.xlsx"
+            with pd.ExcelWriter(path) as w:  # 見出しの上に表題行がある形も読めること
+                pd.DataFrame([["東証上場銘柄一覧"]]).to_excel(w, index=False, header=False)
+                df.to_excel(w, index=False, startrow=2)
+            self.assertEqual(universe.cached_jpx_list(Path(d)), path)
+            got = universe.load_jpx_list(path)
+        self.assertEqual([(s.symbol, s.market) for s in got], [("7203.T", "プライム")])
+
     def test_fx_unit_is_1000(self):
         fx = universe.fx_symbols()
         self.assertIn("USDJPY=X", [s.symbol for s in fx])
