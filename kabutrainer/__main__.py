@@ -26,18 +26,24 @@ def cmd_update(args: argparse.Namespace) -> int:
     _print(f"保存先: {db}")
     with PriceStore(db) as store:
         if not args.skip_list:
-            xls = paths.data_dir() / "data_j.xls"
+            xls = None
             try:
                 _print("JPXの銘柄一覧を取得しています…")
-                universe.download_jpx_list(xls)
+                xls = universe.download_jpx_list(paths.data_dir())
             except Exception as e:  # 取れなくても前回の一覧で続ける
                 _print(f"銘柄一覧を取得できませんでした: {e}")
-                if not xls.exists():
+                xls = universe.cached_jpx_list(paths.data_dir())
+                if xls is None:
                     _print("前回の一覧もないため、為替だけで続けます。")
-            if xls.exists():
-                stocks = universe.load_jpx_list(xls)
-                added, removed = store.sync_symbols(stocks, "stock")
-                _print(f"株: {len(stocks)}銘柄（新規 {added}、一覧から外れた {removed}）")
+            if xls is not None:
+                try:
+                    stocks = universe.load_jpx_list(xls)
+                except Exception as e:
+                    _print(f"銘柄一覧を読み取れませんでした: {e}")
+                    stocks = []
+                if stocks:
+                    added, removed = store.sync_symbols(stocks, "stock")
+                    _print(f"株: {len(stocks)}銘柄（新規 {added}、一覧から外れた {removed}）")
             store.sync_symbols(universe.fx_symbols(), "fx")
 
         targets = [s.symbol for s in store.symbols()]
